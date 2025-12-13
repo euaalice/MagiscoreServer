@@ -7,6 +7,7 @@ const axios = require('axios');
 
 const Magistrado = require("../models/magistrado");
 const Usuario = require("../models/usuario");
+const { authenticateToken, requireUserType } = require('../middlewares/auth');
 
 function generateToken(params = {}) {
 	const token = jwt.sign(params, auth.secret, {
@@ -15,8 +16,8 @@ function generateToken(params = {}) {
 	return token;
 }
 
-// Middleware to verify token and extract user
-function authenticateToken(req, res, next) {
+// Middleware to verify token and extract user (DEPRECATED - use authenticateToken from middlewares/auth.js)
+function authenticateTokenOld(req, res, next) {
     const token = req.headers['authorization'];
     if (!token) return res.sendStatus(401);
 
@@ -28,27 +29,60 @@ function authenticateToken(req, res, next) {
 }
 
 router.post('/cria_usuario', async (req, res) => {
-	const { nome, email, senha } = req.body;
-    // Hash the password
+	const { nome, email, senha, tipo, oab, cnj } = req.body;
 
-    const hashedPassword = await bcrypt.hash(senha, 10); // it's already in the schema file
+    // Validações
+    if (!nome || !email || !senha) {
+        return res.status(400).send({ error: 'Nome, email e senha são obrigatórios' });
+    }
+
+    // Validação específica por tipo
+    if (tipo === 'advogado' && !oab) {
+        return res.status(400).send({ error: 'OAB é obrigatória para advogados' });
+    }
+
+    if (tipo === 'magistrado' && !cnj) {
+        return res.status(400).send({ error: 'CNJ é obrigatório para magistrados' });
+    }
+
+    // Hash the password
+    const hashedPassword = await bcrypt.hash(senha, 10);
 
     try {
 		if (await Usuario.findOne({ email })) {
 			return res.status(400).send({ error: 'E-mail já cadastrado!' });
 		}
 
-        
-        
-		const user = await Usuario.create({nome, email, senha:hashedPassword});
-        
-        const token = generateToken({ id: user.id });
+        const userData = {
+            nome, 
+            email, 
+            senha: hashedPassword,
+            tipo: tipo || 'comum'
+        };
 
-        console.log(token);
-		console.log(user);
+        // Adiciona campos específicos se fornecidos
+        if (oab) userData.oab = oab;
+        if (cnj) userData.cnj = cnj;
+        
+		const user = await Usuario.create(userData);
+        
+        const token = generateToken({ 
+            id: user.id, 
+            tipo: user.tipo,
+            email: user.email
+        });
 
-
-		return res.send({ user, token: generateToken({ id: user.id }) });
+		return res.send({ 
+            user: {
+                id: user.id,
+                nome: user.nome,
+                email: user.email,
+                tipo: user.tipo,
+                oab: user.oab,
+                cnj: user.cnj
+            }, 
+            token 
+        });
 	} catch (err) {
 		console.log(err);
 		return res.status(400).send({ error: 'Falha de registro!' });
@@ -85,24 +119,40 @@ router.post('/entrar_usuario', async (req, res) => {
             return res.status(400).send({ error: 'User not found' });
         }
 
-        // Log the retrieved user and password for debugging
-        console.log('Retrieved user:', user);
-        console.log('Provided password:', senha);
-        console.log('Stored password:', user.senha);
+        // Se usuário tem googleId mas não tem senha, significa que só usa Google login
+        if (user.googleId && !user.senha) {
+            return res.status(400).send({ 
+                error: 'Esta conta usa login do Google. Por favor, faça login com o Google.' 
+            });
+        }
         
         // Check if the password is correct
         const isPasswordValid = await bcrypt.compare(senha, user.senha);
-        console.log(`senha:${isPasswordValid}`)
 
         if (!isPasswordValid) {
             return res.status(400).send({ error: 'Invalid password' });
         }
 
         // Generate a token
-        const token = generateToken({ id: user.id });
+        const token = generateToken({ 
+            id: user.id,
+            tipo: user.tipo,
+            email: user.email
+        });
 
         // Send the user and token as response
-        res.send({ user, token });
+        res.send({ 
+            user: {
+                id: user.id,
+                nome: user.nome,
+                email: user.email,
+                tipo: user.tipo,
+                oab: user.oab,
+                cnj: user.cnj,
+                foto: user.foto
+            }, 
+            token 
+        });
     } catch (err) {
         console.error(err);
         res.status(500).send({ error: 'Internal server error' });
@@ -149,7 +199,7 @@ router.post('/buscar_magistrado', async(req, res) => {
     }
 });
 
-// Cria avaliação e magistrado (se não existir)
+// Cria avaliação e magistrado (se não existir) - Apenas usuários autenticados
 router.post('/avaliar_magistrado', authenticateToken, async(req, res) => {
     try {
         const { nomeMagistrado, idadeMagistrado, nota, comentario } = req.body;
@@ -251,6 +301,120 @@ router.get('/ranking_magistrados', async (req, res) => {
     } catch (err) {
         console.error('Erro ao gerar ranking:', err);
         return res.status(500).send({ error: 'Erro ao gerar ranking' });
+    }
+});
+
+// ============ ROTAS ESPECÍFICAS POR TIPO DE USUÁRIO ============
+
+// Rota protegida - apenas usuários autenticados
+router.get('/perfil', authenticateToken, async (req, res) => {
+    try {
+        const user = await Usuario.findById(req.user.id).select('-senha');
+        if (!user) {
+            return res.status(404).send({ error: 'Usuário não encontrado' });
+        }
+        return res.send(user);
+    } catch (err) {
+        console.error('Erro ao buscar perfil:', err);
+        return res.status(500).send({ error: 'Erro ao buscar perfil' });
+    }
+});
+
+// Rota para atualizar tipo de usuário (ex: comum -> advogado)
+router.put('/atualizar_tipo', authenticateToken, async (req, res) => {
+    try {
+        const { tipo, oab, cnj } = req.body;
+        const userId = req.user.id;
+
+        if (!['comum', 'advogado', 'magistrado'].includes(tipo)) {
+            return res.status(400).send({ error: 'Tipo inválido' });
+        }
+
+        if (tipo === 'advogado' && !oab) {
+            return res.status(400).send({ error: 'OAB é obrigatória para advogados' });
+        }
+
+        if (tipo === 'magistrado' && !cnj) {
+            return res.status(400).send({ error: 'CNJ é obrigatório para magistrados' });
+        }
+
+        const updateData = { tipo };
+        if (oab) updateData.oab = oab;
+        if (cnj) updateData.cnj = cnj;
+
+        const user = await Usuario.findByIdAndUpdate(userId, updateData, { new: true }).select('-senha');
+
+        // Gera novo token com tipo atualizado
+        const token = generateToken({ 
+            id: user.id,
+            tipo: user.tipo,
+            email: user.email
+        });
+
+        return res.send({ user, token });
+    } catch (err) {
+        console.error('Erro ao atualizar tipo:', err);
+        return res.status(500).send({ error: 'Erro ao atualizar tipo de usuário' });
+    }
+});
+
+// Rota para advogados verem seus clientes (exemplo de funcionalidade específica)
+router.get('/advogado/clientes', authenticateToken, requireUserType('advogado'), async (req, res) => {
+    try {
+        // Aqui você pode implementar lógica específica para advogados
+        // Por exemplo, listar clientes associados
+        return res.send({ 
+            message: 'Rota específica para advogados',
+            oab: req.user.oab 
+        });
+    } catch (err) {
+        console.error('Erro:', err);
+        return res.status(500).send({ error: 'Erro ao buscar clientes' });
+    }
+});
+
+// Rota para magistrados verem estatísticas (exemplo de funcionalidade específica)
+router.get('/magistrado/estatisticas', authenticateToken, requireUserType('magistrado'), async (req, res) => {
+    try {
+        // Aqui você pode implementar lógica específica para magistrados
+        // Por exemplo, estatísticas de processos
+        return res.send({ 
+            message: 'Rota específica para magistrados',
+            cnj: req.user.cnj 
+        });
+    } catch (err) {
+        console.error('Erro:', err);
+        return res.status(500).send({ error: 'Erro ao buscar estatísticas' });
+    }
+});
+
+// Rota para usuários comuns verem suas avaliações
+router.get('/usuario/minhas_avaliacoes', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        // Busca todos os magistrados e filtra as avaliações do usuário
+        const magistrados = await Magistrado.find({ 'avaliacoes.usuario': userId })
+            .populate('avaliacoes.usuario', 'nome email');
+
+        const minhasAvaliacoes = magistrados.map(mag => {
+            const avaliacaoUsuario = mag.avaliacoes.find(
+                av => av.usuario._id.toString() === userId
+            );
+            return {
+                magistrado: {
+                    id: mag._id,
+                    nome: mag.nome,
+                    idade: mag.idade
+                },
+                avaliacao: avaliacaoUsuario
+            };
+        });
+
+        return res.send(minhasAvaliacoes);
+    } catch (err) {
+        console.error('Erro ao buscar avaliações:', err);
+        return res.status(500).send({ error: 'Erro ao buscar avaliações' });
     }
 });
 
