@@ -3,6 +3,7 @@ const router = express.Router();
 const passport = require('../../config/passport');
 const jwt = require('jsonwebtoken');
 const auth = require('../../config/auth.json');
+const { authenticateToken } = require('../middlewares/auth');
 
 function generateToken(params = {}) {
     const token = jwt.sign(params, auth.secret, {
@@ -39,22 +40,10 @@ router.get('/google/callback',
 );
 
 // Rota para verificar status de autenticação
-router.get('/status', (req, res) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-        return res.status(401).send({ authenticated: false });
-    }
-
-    jwt.verify(token, auth.secret, (err, decoded) => {
-        if (err) {
-            return res.status(403).send({ authenticated: false });
-        }
-        return res.send({ 
-            authenticated: true, 
-            user: decoded 
-        });
+router.get('/status', authenticateToken, (req, res) => {
+    return res.send({ 
+        authenticated: true, 
+        user: req.user 
     });
 });
 
